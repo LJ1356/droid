@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import time
 from collections import defaultdict
 
@@ -30,22 +31,54 @@ calib_flags = cv2.CALIB_USE_INTRINSIC_GUESS + cv2.CALIB_FIX_PRINCIPAL_POINT + cv
 dir_path = os.path.dirname(os.path.realpath(__file__))
 calib_info_filepath = os.path.join(dir_path, "calibration_info.json")
 
+# data-collection scopes each robot to a workspace and spawns us with $DC_WORKSPACE set (see
+# data-collection/server/lib/sessions.js). Each robot has its own cameras, so a workspace can carry
+# its own extrinsics in calibration_info_<workspace>.json, layered over the defaults. Same name rule
+# as collect.config.WORKSPACE_RE, which also stops a name escaping this dir via path traversal.
+WORKSPACE_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+
+
+def workspace_calib_filepath():
+    """Calibration file for the active workspace, or None outside one. Existence is not checked."""
+    workspace = (os.environ.get("DC_WORKSPACE") or "").strip()
+    if not workspace:
+        return None
+    if not WORKSPACE_RE.match(workspace):
+        raise ValueError(f"invalid DC_WORKSPACE {workspace!r} (allowed: {WORKSPACE_RE.pattern})")
+    return os.path.join(dir_path, f"calibration_info_{workspace}.json")
+
 
 def load_calibration_info(keep_time=False):
-    if not os.path.isfile(calib_info_filepath):
-        return {}
-    with open(calib_info_filepath, "r") as jsonFile:
-        calibration_info = json.load(jsonFile)
+    calibration_info = {}
+    if os.path.isfile(calib_info_filepath):
+        with open(calib_info_filepath, "r") as jsonFile:
+            calibration_info = json.load(jsonFile)
+
+    # Keys are camera serials, so a workspace only needs the cameras it actually has; the rest fall
+    # through to the defaults.
+    ws_filepath = workspace_calib_filepath()
+    if ws_filepath is not None and os.path.isfile(ws_filepath):
+        with open(ws_filepath, "r") as jsonFile:
+            calibration_info.update(json.load(jsonFile))
+
     if not keep_time:
         calibration_info = {key: data["pose"] for key, data in calibration_info.items()}
     return calibration_info
 
 
 def update_calibration_info(cam_id, transformation):
-    calibration_info = load_calibration_info(keep_time=True)
+    # Write to the workspace layer when there is one — writing to the defaults would leave the
+    # workspace entry shadowing the fresh measurement, since it is merged last.
+    target_filepath = workspace_calib_filepath() or calib_info_filepath
+
+    # Read the target layer alone, not the merged view, so defaults aren't copied into it.
+    calibration_info = {}
+    if os.path.isfile(target_filepath):
+        with open(target_filepath, "r") as jsonFile:
+            calibration_info = json.load(jsonFile)
     calibration_info[cam_id] = {"pose": list(transformation), "timestamp": time.time()}
 
-    with open(calib_info_filepath, "w") as jsonFile:
+    with open(target_filepath, "w") as jsonFile:
         json.dump(calibration_info, jsonFile)
 
 

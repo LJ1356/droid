@@ -27,9 +27,11 @@ DROID_CONTROL_FREQUENCY = 15
 @dataclasses.dataclass
 class Args:
     # Hardware parameters
+    # Defaults come from the env (TIPTOP_*_CAMERA_ID, same vars as tiptop.yml) so a swapped-in
+    # camera works without a code edit; --wrist-camera-id etc. still override.
     left_camera_id: str = ""  # e.g., "24259877"
-    right_camera_id: str = "32439448"  # e.g., "24514023"
-    wrist_camera_id: str = "14846828"  # e.g., "13062452"
+    right_camera_id: str = os.environ.get("TIPTOP_EXTERNAL_CAMERA_ID", "32439448")  # e.g., "24514023"
+    wrist_camera_id: str = os.environ.get("TIPTOP_HAND_CAMERA_ID", "14846828")  # e.g., "13062452"
 
     # Policy parameters
     external_camera: str | None = (

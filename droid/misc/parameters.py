@@ -11,9 +11,10 @@ robot_type = "fr3"  # 'panda' or 'fr3'
 robot_serial_number = ""
 
 # Camera ID's #
-hand_camera_id = "14846828"
-varied_camera_1_id = "32439448"
-varied_camera_2_id = "31425515"
+# Overridable by env so a swapped-in camera doesn't need a code edit. tiptop.yml reads the same vars.
+hand_camera_id = os.environ.get("TIPTOP_HAND_CAMERA_ID", "14846828")
+varied_camera_1_id = os.environ.get("TIPTOP_EXTERNAL_CAMERA_ID", "32439448")
+varied_camera_2_id = os.environ.get("TIPTOP_EXTERNAL_2_CAMERA_ID", "31425515")
 
 # Charuco Board Params #
 CHARUCOBOARD_ROWCOUNT = 9
