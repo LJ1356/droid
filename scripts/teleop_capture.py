@@ -1,24 +1,33 @@
 # ruff: noqa
-"""SpaceMouse teleoperation + capture driver for the data-collection app's teleop flow.
+"""Teleoperation + capture driver for the data-collection app's teleop flow.
 
-Replaces the VR-headset teleop (``scripts/main.py`` + the Tk GUI) with a **SpaceMouse** controller,
-driven from the browser exactly like the tamp/eval capture drivers (events-file + stdin protocol, see
-``data-collection/ARCHITECTURE.md`` §6). The operator moves the end-effector by pushing/twisting the
-SpaceMouse puck (6-DOF -> Cartesian velocity) and works the gripper with its two buttons; the operator
-decides when each episode ends (from the UI). Every episode is written in the raw episode format (§3)
-so ``collect/build_lerobot.py`` builds it exactly like a tamp episode.
+Drives the arm from either the **VR** (Oculus) controller — same as ``scripts/main.py`` — or a
+**SpaceMouse** (``--device``), and captures each episode from the browser exactly like the tamp/eval
+capture drivers (events-file + stdin protocol, see ``data-collection/ARCHITECTURE.md`` §6). The operator
+moves the end-effector with the chosen controller (6-DOF -> Cartesian velocity) and works the gripper
+(VR trigger, or the SpaceMouse's two buttons); the operator decides when each episode ends (from the
+UI). Every episode is written in the raw episode format (§3) so ``collect/build_lerobot.py`` builds it
+exactly like a tamp episode.
+
+Unlike the old ``scripts/main.py`` + Tk GUI VR flow, session control (start / end / discard / label) is
+driven over the stdin protocol from the browser for BOTH devices — the controller only moves the arm.
 
 Nothing is installed on the NUC — this is a drop-in for the existing PC-side teleop (still talks to the
 NUC's ``run_server.py`` over the same ``StableRobotEnv`` -> ServerInterface path); only the controller
-changes (SpaceMouse instead of VR). The SpaceMouse is read dependency-free (see ``spacemouse.py``).
+changes. VR uses ``droid.controllers.oculus_controller.VRPolicy``; the SpaceMouse is read
+dependency-free (see ``spacemouse.py``).
 
 Protocol (stdin lines written by the Node server):
   {"cmd":"start"}   begin an episode (at the task prompt)
   {"cmd":"end"}     stop + SAVE the current episode        {"cmd":"discard"} stop + throw it away
+  {"cmd":"home"}    send the arm to its home pose (only at the task prompt, between episodes)
   y | n             label the saved episode success/failure   q  finish the session
 
+The arm also returns home automatically at the END of every trajectory (after save / discard / error),
+so it is clear of the workspace before the next episode; the home motion is not part of the recording.
+
 Events (appended to $TELEOP_EVENTS_FILE): session_start, awaiting_task, rollout_start, rollout_saved,
-awaiting_label, labeled, rollout_aborted, session_end.
+awaiting_label, labeled, rollout_aborted, homing, homed, session_end.
 
 Run under the DROID conda env (same as the VR ``scripts/main.py``).
 """
@@ -141,6 +150,63 @@ class SpaceMousePolicy:
         action = np.clip(np.asarray(lin + rot + [grip_vel], dtype=np.float64), -1.0, 1.0)
         return action, self.gripper_target
 
+    def reset(self):
+        """Called when the arm is sent home. The SpaceMouse action is a pure per-frame velocity (no
+        accumulated pose target), so nothing needs re-anchoring; just re-open the gripper target so a
+        new episode starts from a known gripper state."""
+        self.gripper_target = 0.0
+        self._prev = {"left": False, "right": False}
+
+    def wait_ready(self, timeout=8.0):
+        """The SpaceMouse is polled synchronously in ``forward`` (it's already open), so it is always
+        ready once the driver is up."""
+        return True
+
+
+class VRPolicyDriver:
+    """Wraps the DROID Oculus ``VRPolicy`` in the same ``forward(obs) -> (action, gripper_target)``
+    interface as ``SpaceMousePolicy``. The VR policy already produces the full 7-DOF Cartesian-velocity
+    action (including gripper velocity from the trigger); we surface the continuous trigger value as the
+    gripper target so the recorded ``cmd_gripper`` matches the SpaceMouse path. Only the arm is driven
+    from VR — session control (start/end/label) stays on the browser stdin protocol."""
+
+    def __init__(self, controller: str):
+        from droid.controllers.oculus_controller import VRPolicy  # lazy: pulls in oculus_reader
+        self.vr = VRPolicy(right_controller=(controller != "left"))
+
+    def forward(self, obs):
+        action, info = self.vr.forward(obs, include_info=True)
+        gripper_target = float(info.get("target_gripper_position", 0.0))
+        return np.asarray(action, dtype=np.float64).reshape(-1), gripper_target
+
+    def reset(self):
+        """Re-anchor the VR origin to the arm's current pose. Called right before each episode records
+        (the arm is home by then). VRPolicy tracks the robot/controller pose at the start of a motion and
+        drives toward that offset; without a fresh anchor the origin stays pinned to the previous
+        episode's pose and the arm springs back there. Reusing the same call site as the canonical
+        collect_trajectory, which invokes controller.reset_state() immediately before its record loop —
+        doing this at record start (not at home time) also keeps the reader state fresh so the new
+        episode actually picks up controller input."""
+        self.vr.reset_state()
+
+    def wait_ready(self, timeout=8.0):
+        """Block until the Oculus reader is actually streaming controller poses, or ``timeout`` elapses.
+        The reader launches the headset APK and streams poses over ADB/logcat; the first frames lag a
+        second or two after connect, and the headset stops streaming when it sleeps (taken off / idle).
+        Starting an episode in that window leaves VRPolicy with empty poses, so ``forward`` returns an
+        all-zero action and the arm never moves — the intermittent "controller not recognized". Waiting
+        on ``_state['poses']`` confirms the full read thread -> VRPolicy pipeline is live. Returns True
+        once poses arrive, False on timeout."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self.vr._state.get("poses"):
+                return True
+            time.sleep(0.05)
+        return False
+
+    def close(self):
+        pass
+
 
 # --------------------------------------------------------------------------- #
 # Camera extraction (StableRobotEnv images are BGRA, keyed by "{serial}_left")   #
@@ -179,6 +245,8 @@ class Args:
     output_root: str = ""       # runs/<workspace>/teleop/<name>; episodes nest under eval/<ts> (staging)
     instruction: str = ""
     config_id: str = "teleop/teleop"
+    device: str = "vr"              # "vr" (Oculus) or "spacemouse"
+    controller: str = "right"       # VR hand: "right" or "left" (ignored for spacemouse)
     max_deflection: float = 350.0
     pos_gain: float = 1.0
     rot_gain: float = 1.0
@@ -197,6 +265,26 @@ def _halt(env):
         env.step(np.zeros(7, dtype=np.float64))
     except Exception as e:  # noqa: BLE001
         print(f"[teleop] halt failed: {e}", flush=True)
+
+
+def _go_home(env, events):
+    """Return the arm to the home joint configuration (a blocking joint move, via ``env.reset()``). Runs
+    at the end of every trajectory and on the go-home command from the UI. Guarded so a failed reset
+    surfaces an event but never tears down the warm session. The home motion is NOT recorded — it runs
+    after the episode's frames are already captured.
+
+    Note: the controller is re-anchored (``policy.reset()``) at the START of the next episode, not here.
+    Re-anchoring at home time would clear the VR reader state (poses / movement flag) and then sit in
+    that cleared state through the label wait, which drops the next episode's controller input. The
+    canonical ``collect_trajectory`` likewise resets the controller immediately before its record loop."""
+    emit(events, "homing")
+    try:
+        env.reset()
+    except Exception as e:  # noqa: BLE001
+        print(f"[teleop] go home failed: {e}", flush=True)
+        emit(events, "error", message=f"go home failed: {e}")
+        return
+    emit(events, "homed")
 
 
 def record_episode(env, policy, ep_dir, args, events):
@@ -286,11 +374,16 @@ def record_episode(env, policy, ep_dir, args, events):
 
 def main(args: Args):
     events = args.events_file
-    args.external_camera_id = args.external_camera_id or os.environ.get("TIPTOP_EXTERNAL_CAMERA_ID", "")
-    args.external_2_camera_id = args.external_2_camera_id or os.environ.get("TIPTOP_EXTERNAL_2_CAMERA_ID", "")
-    args.hand_camera_id = args.hand_camera_id or os.environ.get("TIPTOP_HAND_CAMERA_ID", "")
-    axis_map = [int(x) for x in str(args.axis_map).split(",")]
-    axis_sign = [float(x) for x in str(args.axis_sign).split(",")]
+    # Camera serials: explicit flag > TIPTOP_*_CAMERA_ID env var > the lab's usual ZED (the default
+    # baked into droid.misc.parameters, the same source tiptop.yml resolves). Falling back to the lab
+    # default — instead of "" — means teleop works even when the server's environment doesn't export
+    # these vars, matching how tiptop/eval find their cameras. Serials that aren't connected simply
+    # don't match a frame (external_2 is optional), so this never forces a missing camera.
+    from droid.misc.parameters import hand_camera_id, varied_camera_1_id, varied_camera_2_id
+    args.external_camera_id = args.external_camera_id or varied_camera_1_id
+    args.external_2_camera_id = args.external_2_camera_id or varied_camera_2_id
+    args.hand_camera_id = args.hand_camera_id or hand_camera_id
+    device = (args.device or "vr").strip().lower()
     output_root = Path(args.output_root)
     (output_root / "eval").mkdir(parents=True, exist_ok=True)
     _install_signal_handlers()
@@ -299,31 +392,48 @@ def main(args: Args):
     env = None
     sm = None
     try:
-        sm = SpaceMouse(max_deflection=args.max_deflection)  # raises (no device / no perms) -> error exit
-        print(f"[teleop] SpaceMouse on {sm.device}", flush=True)
-        policy = SpaceMousePolicy(
-            sm, pos_gain=args.pos_gain, rot_gain=args.rot_gain, gripper_gain=args.gripper_gain,
-            deadzone=args.deadzone, axis_map=axis_map, axis_sign=axis_sign,
-        )
+        if device == "spacemouse":
+            axis_map = [int(x) for x in str(args.axis_map).split(",")]
+            axis_sign = [float(x) for x in str(args.axis_sign).split(",")]
+            sm = SpaceMouse(max_deflection=args.max_deflection)  # raises (no device / no perms) -> error exit
+            print(f"[teleop] SpaceMouse on {sm.device}", flush=True)
+            policy = SpaceMousePolicy(
+                sm, pos_gain=args.pos_gain, rot_gain=args.rot_gain, gripper_gain=args.gripper_gain,
+                deadzone=args.deadzone, axis_map=axis_map, axis_sign=axis_sign,
+            )
+        else:  # "vr" (default)
+            controller = (args.controller or "right").strip().lower()
+            policy = VRPolicyDriver(controller)  # raises (headset not reachable) -> error exit
+            print(f"[teleop] VR Oculus ({controller} controller)", flush=True)
         from droid.stable_camera_env import StableRobotEnv  # lazy: DROID env only
         env = StableRobotEnv(action_space="cartesian_velocity", gripper_action_space=None)
         print("[teleop] created the DROID env", flush=True)
 
-        first = True
         while True:
             emit(events, "awaiting_task")
             cmd = _read_line_blocking()
             if cmd == "q":
                 break
+            if isinstance(cmd, dict) and cmd.get("cmd") == "home":
+                _go_home(env, events)  # manual go-home from the UI (only at the prompt, arm idle)
+                continue
             if not (isinstance(cmd, dict) and cmd.get("cmd") == "start"):
                 continue
 
-            if not first:
-                try:
-                    env.reset()
-                except Exception as e:  # noqa: BLE001
-                    print(f"[teleop] env.reset() failed: {e}", flush=True)
-            first = False
+            # Re-anchor the controller to the arm's CURRENT pose right before recording — this is where
+            # the canonical collect_trajectory calls controller.reset_state(). For VR this pins the
+            # tracking origin to where the arm is now (home, since each trajectory ends homed), so the
+            # arm neither springs back to the previous episode's pose nor ignores the controller.
+            policy.reset()
+
+            # Don't start recording until the controller is actually streaming — otherwise the first
+            # frames capture a dead arm and the operator sees "controller not recognized". If it never
+            # comes up (headset asleep / off), bail back to the prompt with a clear message.
+            if not policy.wait_ready():
+                emit(events, "error", message=(
+                    "VR controller not detected — put the headset on and wake the controller, then "
+                    "press Start again."))
+                continue
 
             ts = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
             ep_dir = output_root / "eval" / ts   # staging bucket; the label moves it to success/failure
@@ -335,14 +445,17 @@ def main(args: Args):
                 _halt(env)
                 shutil.rmtree(ep_dir, ignore_errors=True)
                 emit(events, "error", message=f"episode failed: {e}")
+                _go_home(env, events)  # every trajectory ends with the arm back home, even a failed one
                 continue
             if n is None:
                 shutil.rmtree(ep_dir, ignore_errors=True)
                 emit(events, "rollout_aborted", dir=str(ep_dir))
+                _go_home(env, events)  # home after a discarded trajectory
                 if quit_session:
                     break
                 continue
             emit(events, "rollout_saved", dir=str(ep_dir), n_frames=n)
+            _go_home(env, events)  # home after a saved trajectory, while the operator labels it
 
             # label -> move the staged episode into success/ or failure/
             emit(events, "awaiting_label", dir=str(ep_dir))
