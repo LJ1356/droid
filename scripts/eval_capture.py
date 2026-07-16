@@ -160,7 +160,57 @@ def _write_video(frames, path):
 # --------------------------------------------------------------------------- #
 # Checkpoint resolution + policy server lifecycle                               #
 # --------------------------------------------------------------------------- #
-def resolve_checkpoint(url: str, openpi_python: str, openpi_dir: str, cache_dir: str) -> str:
+# openpi's create_trained_policy loads norm stats from <checkpoint>/assets/<asset_id> and NOT from the
+# train config's assets_dir -- deliberately, so a policy always normalizes exactly as its training run
+# did. A checkpoint uploaded without its assets/ therefore fails to serve at all, even though the stats
+# it wants are public. This snippet backfills them from the assets_dir THE CONFIG ITSELF DECLARES, i.e.
+# the same source the training run read them from -- never a guess or a nearby substitute. If the
+# config declares no assets, or the file isn't there, we no-op and let serve_policy report it.
+_BACKFILL_NORM_STATS = r"""
+import pathlib, shutil, sys
+import yaml
+config_name, local = sys.argv[1], pathlib.Path(sys.argv[2])
+hits = sorted(pathlib.Path("configs").rglob(f"{config_name}.y*ml"))
+if not hits:
+    print("SKIP no config yaml for %s" % config_name); raise SystemExit
+assets = ((yaml.safe_load(hits[0].read_text()) or {}).get("data") or {}).get("assets") or {}
+assets_dir, asset_id = assets.get("assets_dir"), assets.get("asset_id")
+if not assets_dir or not asset_id:
+    print("SKIP config declares no data.assets.{assets_dir,asset_id}"); raise SystemExit
+dest = local / "assets" / asset_id / "norm_stats.json"
+if dest.exists():
+    print("OK norm stats already in the checkpoint"); raise SystemExit
+from openpi.shared import download
+src = pathlib.Path(download.maybe_download(f"{assets_dir.rstrip('/')}/{asset_id}")) / "norm_stats.json"
+if not src.is_file():
+    print("SKIP no norm_stats.json at %s" % src); raise SystemExit
+dest.parent.mkdir(parents=True, exist_ok=True)
+shutil.copy2(src, dest)
+print("BACKFILLED %s -> %s" % (src, dest))
+"""
+
+
+def backfill_norm_stats(local: str, config: str, openpi_python: str, openpi_dir: str) -> None:
+    """Copy the config's norm stats into a downloaded checkpoint that shipped without them.
+
+    Only ever called for the eval_cache dir we downloaded ourselves -- never a user's local checkpoint
+    or a remote url. Best-effort: a failure here is not fatal (serve_policy reports the real error).
+    """
+    if not config:
+        return
+    try:
+        out = subprocess.run(
+            [openpi_python, "-c", _BACKFILL_NORM_STATS, config, local],
+            cwd=openpi_dir, capture_output=True, text=True, timeout=600,
+        )
+        msg = (out.stdout or out.stderr or "").strip().splitlines()
+        if msg:
+            print(f"[eval] norm stats: {msg[-1]}", flush=True)
+    except (OSError, subprocess.SubprocessError) as e:
+        print(f"[eval] norm-stats backfill skipped ({e})", flush=True)
+
+
+def resolve_checkpoint(url: str, openpi_python: str, openpi_dir: str, cache_dir: str, config: str = "") -> str:
     """Return a directory/URL serve_policy can load. gs://, hf://, and local paths pass through;
     a plain https://huggingface.co/<user>/<repo> is snapshot-downloaded (via the openpi venv, which
     has huggingface_hub) into ``cache_dir`` because serve_policy can't enumerate a single https file."""
@@ -179,6 +229,9 @@ def resolve_checkpoint(url: str, openpi_python: str, openpi_dir: str, cache_dir:
             "allow_patterns=['params/**','assets/**','_CHECKPOINT_METADATA','*.json','model.safetensors']))"
         )
         subprocess.run([openpi_python, "-c", code, repo, local], cwd=openpi_dir, check=True)
+        # `local` is ours (we just created it), so completing it is safe. A gs:///local checkpoint is
+        # someone else's directory and is left exactly as found.
+        backfill_norm_stats(local, config, openpi_python, openpi_dir)
         return local
     return url  # gs:// | hf:// | local path -> serve_policy.maybe_download handles it
 
@@ -270,6 +323,7 @@ class Args:
     config: str = "pi05_droid"       # openpi TrainConfig name (--policy.config)
     url: str = ""                    # checkpoint gs:// | hf:// | https://huggingface.co/... | local
     external_camera: str = "left"    # which external cam feeds the policy: left|right
+    save_video: bool = False         # write the camera mp4s per rollout (off: rubric + state only)
     max_steps: int = 600
     open_loop_horizon: int = 8
     velocity_scale: float = 1.0
@@ -285,6 +339,45 @@ class Args:
 
 class RolloutAborted(Exception):
     """Raised to abort the current rollout (SIGINT / force-stop) without ending the session."""
+
+
+# Manual robot nudges accepted at either prompt, mirroring tiptop_run.ROBOT_COMMANDS for the eval flow.
+# Legal only where the arm is idle AND stdin is being read: the task prompt and the rubric prompt.
+ROBOT_COMMANDS = ("home", "open")
+GRIPPER_OPEN_STEPS = 15  # ~1 s at DROID_CONTROL_FREQUENCY
+
+
+def _run_robot_command(env, cmd: str) -> None:
+    """Run one manual nudge against the warm env. Raises whatever the robot raises."""
+    if cmd == "home":
+        print("[eval] robot: home", flush=True)
+        env.reset()  # blocking update_joints back to reset_joints
+        return
+    if cmd == "open":
+        # Drive the gripper open through env.step -- zero joint velocities, gripper position 0 (=open,
+        # per franka robot.update_gripper: width = max_width * (1 - command)). Deliberately NOT
+        # robot.update_gripper(..., blocking=True): RobotEnv.reset() documents that it times out on this
+        # rig (/dev/ttyUSB0 is held by the bamboo shim). step()'s non-blocking path is the one the policy
+        # itself uses to work the gripper every rollout, so it is the proven route.
+        print("[eval] robot: open gripper", flush=True)
+        action = np.zeros(8, dtype=np.float64)
+        for _ in range(GRIPPER_OPEN_STEPS):
+            env.step(action)
+            time.sleep(1 / DROID_CONTROL_FREQUENCY)
+        return
+    raise ValueError(f"unknown robot command {cmd!r}")
+
+
+def _maybe_robot_command(env, cmd) -> bool:
+    """Run `cmd` if it is a robot nudge; return whether it was one. A nudge that fails is logged and
+    swallowed -- a wedged gripper must not end a warm eval session."""
+    if not (isinstance(cmd, dict) and cmd.get("cmd") in ROBOT_COMMANDS):
+        return False
+    try:
+        _run_robot_command(env, cmd["cmd"])
+    except Exception as e:  # noqa: BLE001
+        print(f"[eval] robot command {cmd['cmd']!r} failed: {e}", flush=True)
+    return True
 
 
 def run_rollout(env, policy_client, args, task, ep_dir, image_tools):
@@ -312,12 +405,16 @@ def run_rollout(env, policy_client, args, task, ep_dir, image_tools):
         ext_img = obs[f"{args.external_camera}_image"]
         if ext_img is None:
             raise RuntimeError(f"external camera '{args.external_camera}' returned no image")
-        ext_frames.append(ext_img)
-        wrist_frames.append(obs["wrist_image"])
-        # Append the second exterior every step (even if None) so it stays index-aligned 1:1 with the
-        # timeline; a dropped frame here would otherwise shift every later ext2 frame. If ANY step
-        # dropped it, we skip ext2 at write time (the build then duplicates exterior_1).
-        ext2_frames.append(obs.get(f"{second_camera}_image"))
+        # Frames are only retained when we intend to write them: a 1800-step rollout holds ~2.7 MB per
+        # 720p frame per camera, so keeping all three streams costs >10 GB of RAM. The policy is still
+        # fed ext_img/wrist below either way -- this only skips the recording buffers.
+        if args.save_video:
+            ext_frames.append(ext_img)
+            wrist_frames.append(obs["wrist_image"])
+            # Append the second exterior every step (even if None) so it stays index-aligned 1:1 with
+            # the timeline; a dropped frame here would otherwise shift every later ext2 frame. If ANY
+            # step dropped it, we skip ext2 at write time (the build then duplicates exterior_1).
+            ext2_frames.append(obs.get(f"{second_camera}_image"))
 
         joint_log.append(np.asarray(obs["joint_position"], dtype=np.float32).reshape(-1))
         grip_log.append(float(np.asarray(obs["gripper_position"]).reshape(-1)[0]))
@@ -359,17 +456,22 @@ def run_rollout(env, policy_client, args, task, ep_dir, image_tools):
     if aborted:
         raise RolloutAborted()
 
-    # Truncate every stream to a common length so frames + state stay aligned 1:1.
-    n = min(len(ext_frames), len(wrist_frames), len(joint_log), len(cmd_jv_log))
+    # Truncate every stream to a common length so frames + state stay aligned 1:1. Without --save-video
+    # the frame buffers are empty by design, so the state logs alone set the length.
+    n = min(len(joint_log), len(cmd_jv_log))
+    if args.save_video:
+        n = min(n, len(ext_frames), len(wrist_frames))
     if n < 2:
         raise RolloutAborted()  # nothing usable captured
     ep_dir = Path(ep_dir)
-    _write_video(ext_frames[:n], ep_dir / EXTERNAL_CAM)
-    _write_video(wrist_frames[:n], ep_dir / HAND_CAM)
-    cameras = {"exterior_image_1_left": EXTERNAL_CAM, "wrist_image_left": HAND_CAM}
-    if len(ext2_frames) >= n and all(f is not None for f in ext2_frames[:n]):
-        _write_video(ext2_frames[:n], ep_dir / EXTERNAL_CAM_2)
-        cameras["exterior_image_2_left"] = EXTERNAL_CAM_2
+    cameras = {}
+    if args.save_video:
+        _write_video(ext_frames[:n], ep_dir / EXTERNAL_CAM)
+        _write_video(wrist_frames[:n], ep_dir / HAND_CAM)
+        cameras = {"exterior_image_1_left": EXTERNAL_CAM, "wrist_image_left": HAND_CAM}
+        if len(ext2_frames) >= n and all(f is not None for f in ext2_frames[:n]):
+            _write_video(ext2_frames[:n], ep_dir / EXTERNAL_CAM_2)
+            cameras["exterior_image_2_left"] = EXTERNAL_CAM_2
 
     joints = np.stack(joint_log[:n])
     frame_time = np.asarray(ft_log[:n], dtype=np.float64)
@@ -412,9 +514,14 @@ def _read_command():
 def main(args: Args):
     events = args.events_file
     tasks = json.loads(Path(args.tasks_file).read_text()) if args.tasks_file else {}
-    args.left_camera_id = args.left_camera_id or os.environ.get("TIPTOP_EXTERNAL_CAMERA_ID", "")
-    args.right_camera_id = args.right_camera_id or os.environ.get("TIPTOP_EXTERNAL_2_CAMERA_ID", "")
-    args.wrist_camera_id = args.wrist_camera_id or os.environ.get("TIPTOP_HAND_CAMERA_ID", "")
+    # Serials fall back to the same source the ZED env itself reads (parameters.py already applies the
+    # TIPTOP_*_CAMERA_ID overrides on top of the rig's defaults), so an unset env resolves to the real
+    # cameras instead of "" -- which matched nothing and failed as "Could not find wrist camera image".
+    from droid.misc.parameters import hand_camera_id, varied_camera_1_id, varied_camera_2_id
+
+    args.left_camera_id = args.left_camera_id or varied_camera_1_id
+    args.right_camera_id = args.right_camera_id or varied_camera_2_id
+    args.wrist_camera_id = args.wrist_camera_id or hand_camera_id
     output_root = Path(args.output_root)
     output_root.mkdir(parents=True, exist_ok=True)
     _install_signal_handlers()
@@ -424,7 +531,7 @@ def main(args: Args):
     try:
         # 1) resolve checkpoint (may snapshot-download), then pick a free port + start the server.
         cache_dir = os.path.join(args.openpi_dir or ".", "checkpoints", "eval_cache")
-        checkpoint = resolve_checkpoint(args.url, args.openpi_python, args.openpi_dir, cache_dir)
+        checkpoint = resolve_checkpoint(args.url, args.openpi_python, args.openpi_dir, cache_dir, args.config)
         args.remote_port = _free_port()  # picked here (post-download) so pick->bind is ~ms
         server = start_policy_server(args.openpi_python, args.openpi_dir, args.config, checkpoint, args.remote_port)
         wait_for_server(args.remote_host, args.remote_port, server)
@@ -444,6 +551,10 @@ def main(args: Args):
             cmd = _read_command()
             if cmd is None or cmd == "q":
                 break
+            # A nudge loops straight back to the top, re-emitting awaiting_task -- which is what tells
+            # the server to clear robotBusy and re-enable the buttons.
+            if _maybe_robot_command(env, cmd):
+                continue
             if not isinstance(cmd, dict) or "task" not in cmd:
                 continue
             task_id = str(cmd["task"])
@@ -484,6 +595,17 @@ def main(args: Args):
                 rub = _read_command()
                 if rub is None or rub == "q":
                     finish = True
+                    break
+                if _maybe_robot_command(env, rub):
+                    # Re-emit the prompt we are still parked at, so the server clears robotBusy (a
+                    # state that never changed emits nothing on its own) and keeps awaiting the rubric.
+                    emit(events, "awaiting_label", dir=str(ep_dir), task=task_id)
+                    continue
+                if isinstance(rub, dict) and rub.get("cmd") == "reject":
+                    # Rejected: the rollout was invalid (bad scene, bumped table, policy never moved).
+                    # Drop it entirely -- no rubric.json, so it never reaches the dense/sparse aggregate.
+                    shutil.rmtree(ep_dir, ignore_errors=True)
+                    emit(events, "rollout_discarded", dir=str(ep_dir), task=task_id)
                     break
                 if isinstance(rub, dict) and "rubric" in rub:
                     submitted = rub.get("rubric") or {}
