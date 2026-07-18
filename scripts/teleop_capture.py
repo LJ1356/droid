@@ -51,6 +51,11 @@ from eval_capture import emit, write_meta, write_robot_state_npz, _write_video  
 from spacemouse import SpaceMouse  # noqa: E402
 
 CONTROL_HZ = 15  # matches StableRobotEnv.control_hz + the LeRobot build FPS
+# The env's action_dict["joint_velocity"] is the IK-commanded joint velocity ALREADY NORMALIZED to
+# [-1,1] (see droid/franka/robot.py::create_action_dict + robot_ik_solver.py) -- exactly the DROID /
+# lerobot/droid_1.0.1 action convention. We record it AS-IS (no scaling); build_lerobot just CLIPS it
+# for the teleop kind and does NOT re-normalize it (unlike the rad/s tamp/plan path). So there is no
+# double normalization: the IK value is normalized once, at its source (the robot's IK solver).
 EXTERNAL_CAM, EXTERNAL_CAM_2, HAND_CAM = "external_cam.mp4", "external_cam_2.mp4", "hand_cam.mp4"
 
 # SIGINT (force-stop, sent to the DRIVER pid only) discards the in-flight episode and halts the arm,
@@ -292,6 +297,7 @@ def record_episode(env, policy, ep_dir, args, events):
     save (None if discarded), and ``quit`` True when the operator asked to finish the whole session."""
     ext_frames, ext2_frames, wrist_frames = [], [], []
     joint_log, grip_log, ft_log, cmd_g_log = [], [], [], []
+    cmd_jv_log, cmd_jp_log = [], []  # IK-COMMANDED joint velocity / target position from env.step
     _ABORT_EP["v"] = False  # clear any SIGINT that arrived while parked at the prompt
     ended, quit_session = None, False
     try:
@@ -326,7 +332,20 @@ def record_episode(env, policy, ep_dir, args, events):
 
             action, gtarget = policy.forward(obs)
             cmd_g_log.append(1.0 if gtarget > 0.5 else 0.0)
-            env.step(action)
+            # env.step returns the DROID action_dict. joint_velocity is the IK command (operator
+            # cartesian velocity -> IK joint_delta / max_joint_delta), NORMALIZED to [-1,1] exactly like
+            # lerobot/droid_1.0.1; joint_position is the IK commanded target (measured + joint_delta).
+            # Capturing these is the whole point: finite-differencing the MEASURED joints instead gives
+            # the ACHIEVED motion, which undertracks the command ~4-5x and puts teleop on a different
+            # scale than DROID.
+            info = env.step(action)
+            if not isinstance(info, dict) or "joint_velocity" not in info or "joint_position" not in info:
+                raise RuntimeError(
+                    "env.step did not return the DROID action_dict with joint_velocity/joint_position; "
+                    "cannot capture the IK-commanded joint velocity"
+                )
+            cmd_jv_log.append(np.asarray(info["joint_velocity"], dtype=np.float32).reshape(7))
+            cmd_jp_log.append(np.asarray(info["joint_position"], dtype=np.float32).reshape(7))
 
             dt = time.time() - t0
             if dt < 1.0 / CONTROL_HZ:
@@ -334,7 +353,7 @@ def record_episode(env, policy, ep_dir, args, events):
     finally:
         _halt(env)  # always stop the arm when recording ends (end / discard / error / stop)
 
-    n = min(len(ext_frames), len(wrist_frames), len(joint_log), len(cmd_g_log))
+    n = min(len(ext_frames), len(wrist_frames), len(joint_log), len(cmd_g_log), len(cmd_jv_log), len(cmd_jp_log))
     if ended == "discard" or n < 2:
         return None, quit_session
 
@@ -348,12 +367,14 @@ def record_episode(env, policy, ep_dir, args, events):
 
     jp = np.stack(joint_log[:n])                                  # measured joints [n,7]
     frame_time = np.asarray(ft_log[:n], dtype=np.float64)
-    # The arm is Cartesian-velocity controlled, so there is no commanded joint velocity. Derive the
-    # ACHIEVED joint motion from the demonstration (a valid BC target, and honest — unlike the old
-    # teleop stub): cmd_joint_velocity[t] = (q[t+1]-q[t])*fps, cmd_joint_position[t] = q[t+1].
-    cmd_jv = np.zeros((n, 7), dtype=np.float32)
-    cmd_jv[:-1] = ((jp[1:] - jp[:-1]) * CONTROL_HZ).astype(np.float32)
-    cmd_jp = np.vstack([jp[1:], jp[-1:]]).astype(np.float32)
+    # cmd_joint_velocity / cmd_joint_position are the IK COMMAND captured from env.step's action_dict --
+    # the SAME quantities DROID records (droid/franka/robot.py create_action_dict). joint_velocity is
+    # ALREADY normalized to [-1,1] (the DROID action convention), so we store it AS-IS; build_lerobot
+    # only clips it for the teleop kind (it does NOT divide by 3 -- that is the rad/s tamp/plan path).
+    # cmd_joint_position is the IK commanded target (radians). This REPLACES the old finite-difference
+    # of the MEASURED joints, which captured the achieved (undertracked) motion ~4-5x below the command.
+    cmd_jv = np.stack(cmd_jv_log[:n]).astype(np.float32)          # IK command, normalized [-1,1]
+    cmd_jp = np.stack(cmd_jp_log[:n]).astype(np.float32)          # IK commanded target joint positions
     write_robot_state_npz(
         ep_dir / "robot_state.npz",
         joint_position=jp,
