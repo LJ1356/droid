@@ -327,6 +327,12 @@ class Args:
     max_steps: int = 600
     open_loop_horizon: int = 8
     velocity_scale: float = 1.0
+    # Joint configuration (7 x radians) the arm is driven to at the START of every rollout, after the
+    # between-rollout reset to RobotEnv.reset_joints. Unset -> rollouts start at reset_joints, i.e. the
+    # DROID home pose. Set it for policies trained on tiptop data: tiptop records from cfg.robot.q_capture
+    # (tiptop_run.py drives home -> q_capture before recording), which is ~1.1 rad away from home at
+    # joints 2/4/6, so a rollout started at home begins well outside the training distribution.
+    initial_qpos: list[float] | None = None
     remote_host: str = "127.0.0.1"
     remote_port: int = 8000
     openpi_python: str = ""          # interpreter for serve_policy.py (openpi venv)
@@ -345,6 +351,28 @@ class RolloutAborted(Exception):
 # Legal only where the arm is idle AND stdin is being read: the task prompt and the rubric prompt.
 ROBOT_COMMANDS = ("home", "open")
 GRIPPER_OPEN_STEPS = 15  # ~1 s at DROID_CONTROL_FREQUENCY
+QPOS_DOF = 7
+
+
+def _validate_qpos(qpos):
+    """Normalize an --initial-qpos to a float list, or None when unset. Raises on a bad length/value so
+    a typo'd policy yml fails at session start rather than moving the arm somewhere unintended."""
+    if qpos is None:
+        return None
+    vals = [float(v) for v in qpos]
+    if len(vals) != QPOS_DOF:
+        raise ValueError(f"initial_qpos must have {QPOS_DOF} joint values, got {len(vals)}: {vals}")
+    return vals
+
+
+def _go_to_qpos(env, qpos) -> None:
+    """Blocking joint move to `qpos`, through the same update_joints path RobotEnv.reset() uses (a
+    direct joint interpolation -- no motion planning, so `qpos` must be reachable from the pose the
+    arm parks at between rollouts). No-op when `qpos` is None."""
+    if qpos is None:
+        return
+    print(f"[eval] robot: initial qpos {qpos}", flush=True)
+    env._robot.update_joints(np.asarray(qpos, dtype=np.float64), velocity=False, blocking=True)
 
 
 def _run_robot_command(env, cmd: str) -> None:
@@ -513,6 +541,7 @@ def _read_command():
 
 def main(args: Args):
     events = args.events_file
+    args.initial_qpos = _validate_qpos(args.initial_qpos)  # fail before the policy server / robot come up
     tasks = json.loads(Path(args.tasks_file).read_text()) if args.tasks_file else {}
     # Serials fall back to the same source the ZED env itself reads (parameters.py already applies the
     # TIPTOP_*_CAMERA_ID overrides on top of the rig's defaults), so an unset env resolves to the real
@@ -564,12 +593,21 @@ def main(args: Args):
                 continue
             task.setdefault("id", task_id)
 
+            # Mirror tiptop's per-episode reset (tiptop_run.py:812-826): park at home to clear the
+            # workspace, then move to the rollout's start pose. The first rollout skips the reset --
+            # RobotEnv's constructor already homed the arm -- but still takes the initial_qpos move.
             if not first:
                 try:
                     env.reset()
                 except Exception as e:  # noqa: BLE001
                     print(f"[eval] env.reset() failed: {e}", flush=True)
             first = False
+            try:
+                _go_to_qpos(env, args.initial_qpos)
+            except Exception as e:  # noqa: BLE001
+                # Same posture as a failed reset: surface it and roll anyway (from home). The rollout is
+                # then off-distribution rather than lost, and the log says why if it scores badly.
+                print(f"[eval] initial qpos move failed, starting from home: {e}", flush=True)
 
             ts = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
             ep_dir = output_root / task_id / ts
