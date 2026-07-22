@@ -36,6 +36,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from typing import List, Optional
 
 import numpy as np
 
@@ -332,7 +333,7 @@ class Args:
     # DROID home pose. Set it for policies trained on tiptop data: tiptop records from cfg.robot.q_capture
     # (tiptop_run.py drives home -> q_capture before recording), which is ~1.1 rad away from home at
     # joints 2/4/6, so a rollout started at home begins well outside the training distribution.
-    initial_qpos: list[float] | None = None
+    initial_qpos: Optional[List[float]] = None
     remote_host: str = "127.0.0.1"
     remote_port: int = 8000
     openpi_python: str = ""          # interpreter for serve_policy.py (openpi venv)
