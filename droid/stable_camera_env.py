@@ -313,11 +313,16 @@ class StableRobotEnv:
         camera_serials: list[str] | None = None,
         frame_rate: int = 30,
         camera_resolutions: dict[str, str] | None = None,
+        do_reset: bool = True,
     ):
         """
         Args:
             camera_resolutions: Optional dict mapping serial -> resolution string
                 ("720", "1080", "2k"). Cameras not in the dict use "720".
+            do_reset: forwarded to RobotEnv. Set False to skip the blocking move to
+                reset_joints on construction, so the arm stays wherever it already is
+                (e.g. handed off mid-pose from another controller) instead of being
+                yanked to the fixed reset pose before teleop starts.
         """
         if camera_serials is None:
             camera_serials = _discover_zed_serials()
@@ -331,6 +336,7 @@ class StableRobotEnv:
             action_space=action_space,
             gripper_action_space=gripper_action_space,
             camera_kwargs={"skip_cameras": True},
+            do_reset=do_reset,
         )
 
         # Shared event: gates the grab loop for ALL cameras.
