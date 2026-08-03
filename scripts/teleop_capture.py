@@ -262,6 +262,7 @@ class Args:
     external_camera_id: str = ""
     external_2_camera_id: str = ""
     hand_camera_id: str = ""
+    keep_pose: bool = False  # skip the startup reset-to-home move; arm stays wherever it already is
 
 
 def _halt(env):
@@ -427,7 +428,11 @@ def main(args: Args):
             policy = VRPolicyDriver(controller)  # raises (headset not reachable) -> error exit
             print(f"[teleop] VR Oculus ({controller} controller)", flush=True)
         from droid.stable_camera_env import StableRobotEnv  # lazy: DROID env only
-        env = StableRobotEnv(action_space="cartesian_velocity", gripper_action_space=None)
+        env = StableRobotEnv(
+            action_space="cartesian_velocity", gripper_action_space=None, do_reset=not args.keep_pose
+        )
+        if args.keep_pose:
+            print("[teleop] --keep-pose: skipped startup reset, arm stays at its current pose", flush=True)
         print("[teleop] created the DROID env", flush=True)
 
         while True:
@@ -443,8 +448,9 @@ def main(args: Args):
 
             # Re-anchor the controller to the arm's CURRENT pose right before recording — this is where
             # the canonical collect_trajectory calls controller.reset_state(). For VR this pins the
-            # tracking origin to where the arm is now (home, since each trajectory ends homed), so the
-            # arm neither springs back to the previous episode's pose nor ignores the controller.
+            # tracking origin to where the arm is now (home, since each trajectory ends homed -- unless
+            # --keep-pose, in which case it's wherever the previous controller left it), so the arm
+            # neither springs back to the previous episode's pose nor ignores the controller.
             policy.reset()
 
             # Don't start recording until the controller is actually streaming — otherwise the first
@@ -466,17 +472,20 @@ def main(args: Args):
                 _halt(env)
                 shutil.rmtree(ep_dir, ignore_errors=True)
                 emit(events, "error", message=f"episode failed: {e}")
-                _go_home(env, events)  # every trajectory ends with the arm back home, even a failed one
+                if not args.keep_pose:
+                    _go_home(env, events)  # every trajectory ends with the arm back home, even a failed one
                 continue
             if n is None:
                 shutil.rmtree(ep_dir, ignore_errors=True)
                 emit(events, "rollout_aborted", dir=str(ep_dir))
-                _go_home(env, events)  # home after a discarded trajectory
+                if not args.keep_pose:
+                    _go_home(env, events)  # home after a discarded trajectory
                 if quit_session:
                     break
                 continue
             emit(events, "rollout_saved", dir=str(ep_dir), n_frames=n)
-            _go_home(env, events)  # home after a saved trajectory, while the operator labels it
+            if not args.keep_pose:
+                _go_home(env, events)  # home after a saved trajectory, while the operator labels it
 
             # label -> move the staged episode into success/ or failure/
             emit(events, "awaiting_label", dir=str(ep_dir))
