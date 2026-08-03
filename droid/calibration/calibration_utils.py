@@ -14,16 +14,35 @@ from droid.misc.parameters import *
 from droid.misc.transformations import *
 
 # Create Board #
-CHARUCO_BOARD = aruco.CharucoBoard_create(
-    squaresX=CHARUCOBOARD_COLCOUNT,
-    squaresY=CHARUCOBOARD_ROWCOUNT,
-    squareLength=CHARUCOBOARD_CHECKER_SIZE,
-    markerLength=CHARUCOBOARD_MARKER_SIZE,
-    dictionary=ARUCO_DICT,
-)
+# OpenCV 4.7+ dropped the *_create factories for constructors (same split as ARUCO_DICT in
+# droid.misc.parameters). This runs at IMPORT time, so on a new OpenCV the AttributeError took down
+# every importer of this module — including droid.stable_camera_env, i.e. teleop and eval, neither of
+# which calibrates anything.
+try:
+    # New API (OpenCV 4.7+): size is (squaresX, squaresY).
+    CHARUCO_BOARD = aruco.CharucoBoard(
+        (CHARUCOBOARD_COLCOUNT, CHARUCOBOARD_ROWCOUNT),
+        CHARUCOBOARD_CHECKER_SIZE,
+        CHARUCOBOARD_MARKER_SIZE,
+        ARUCO_DICT,
+    )
+except (AttributeError, TypeError):
+    # Fallback for older OpenCV versions. TypeError as well as AttributeError: pre-4.7 the NAME
+    # aruco.CharucoBoard exists (it is what the factory returns), so the call above resolves and
+    # then fails on the arguments rather than on the lookup.
+    CHARUCO_BOARD = aruco.CharucoBoard_create(
+        squaresX=CHARUCOBOARD_COLCOUNT,
+        squaresY=CHARUCOBOARD_ROWCOUNT,
+        squareLength=CHARUCOBOARD_CHECKER_SIZE,
+        markerLength=CHARUCOBOARD_MARKER_SIZE,
+        dictionary=ARUCO_DICT,
+    )
 
 # Detector Params
-detector_params = cv2.aruco.DetectorParameters_create()
+try:
+    detector_params = cv2.aruco.DetectorParameters()  # New API (OpenCV 4.7+)
+except (AttributeError, TypeError):
+    detector_params = cv2.aruco.DetectorParameters_create()
 detector_params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
 calib_flags = cv2.CALIB_USE_INTRINSIC_GUESS + cv2.CALIB_FIX_PRINCIPAL_POINT + cv2.CALIB_FIX_FOCAL_LENGTH
 

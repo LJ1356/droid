@@ -21,7 +21,12 @@ Protocol (stdin lines written by the Node server):
   {"cmd":"start"}   begin an episode (at the task prompt)
   {"cmd":"end"}     stop + SAVE the current episode        {"cmd":"discard"} stop + throw it away
   {"cmd":"home"}    send the arm to its home pose (only at the task prompt, between episodes)
+  {"cmd":"end_and_quit"}  stop + SAVE, then finish the session -- what "return control to TAMP"
+                    sends mid-recording, since a bare "q" there DISCARDS the episode
   y | n             label the saved episode success/failure   q  finish the session
+
+With --trajectory-id (a tamp->teleop hand-off), episodes are legs of that tamp trajectory: they are
+stamped with the id, left unlabeled in eval/, and never prompt for y/n. See ARCHITECTURE.md §6c.
 
 The arm also returns home automatically at the END of every trajectory (after save / discard / error),
 so it is clear of the workspace before the next episode; the home motion is not part of the recording.
@@ -263,6 +268,11 @@ class Args:
     external_2_camera_id: str = ""
     hand_camera_id: str = ""
     keep_pose: bool = False  # skip the startup reset-to-home move; arm stays wherever it already is
+    # Set by a tamp->teleop hand-off: this session's episodes are LEGS of that tamp trajectory, not
+    # episodes in their own right. They are stamped with the id and left UNLABELED in eval/ -- the
+    # success/failure verdict belongs to the whole trajectory and is given once, on the final tamp
+    # leg, after which collect/merge_trajectory.py joins every leg into one episode.
+    trajectory_id: str = ""
 
 
 def _halt(env):
@@ -312,6 +322,12 @@ def record_episode(env, policy, ep_dir, args, events):
                 break
             if isinstance(cmd, dict) and cmd.get("cmd") == "end":
                 ended = "end"
+                break
+            if isinstance(cmd, dict) and cmd.get("cmd") == "end_and_quit":
+                # "Return control to TAMP" pressed mid-recording. SAVE, then leave the loop: a bare
+                # "q" here would discard the operator's demonstration, and during a hand-off that
+                # demonstration is a segment of the trajectory TAMP is going to finish.
+                ended, quit_session = "end", True
                 break
             if _ABORT_EP["v"]:             # force-stop (SIGINT): discard this episode, stay warm
                 ended = "discard"
@@ -390,6 +406,7 @@ def record_episode(env, policy, ep_dir, args, events):
         instruction=args.instruction, n_frames=n, config_id=args.config_id,
         timestamp=ep_dir.name, cameras=cameras,
         record_start=float(frame_time[0]), record_stop=float(frame_time[-1]),
+        trajectory_id=args.trajectory_id or None, segment_source="teleop",
     )
     return n, quit_session
 
@@ -486,6 +503,17 @@ def main(args: Args):
             emit(events, "rollout_saved", dir=str(ep_dir), n_frames=n)
             if not args.keep_pose:
                 _go_home(env, events)  # home after a saved trajectory, while the operator labels it
+
+            if args.trajectory_id:
+                # A hand-off leg is not a standalone episode, so there is nothing to rate here: it
+                # stays unlabeled in eval/ until the trajectory it belongs to is labeled on the
+                # final tamp leg and merge_trajectory.py folds it in. Prompting would also stall
+                # "Return control to TAMP", which is the operator's actual next action.
+                print(f"[teleop] hand-off leg saved unlabeled in {ep_dir} (trajectory {args.trajectory_id})",
+                      flush=True)
+                if quit_session:
+                    break
+                continue
 
             # label -> move the staged episode into success/ or failure/
             emit(events, "awaiting_label", dir=str(ep_dir))

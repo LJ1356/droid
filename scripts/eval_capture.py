@@ -18,7 +18,7 @@ driver is instead orchestrated by the data-collection Node server: it
        stdin (line protocol) .. {"task":"<id>"} start a rollout | {"rubric":{id:bool,...}} rate the last
                                 rollout | q  finish the session
 
-The heavy imports (``droid.robot_env``, ``openpi_client``, ``moviepy``) are lazy so the pure
+The heavy imports (``droid.robot_env``, ``openpi_client``, ``imageio``'s ffmpeg backend) are lazy so the pure
 data-format helpers below can be unit-tested under any numpy env (``python eval_capture.py selftest``).
 
 Run under the DROID conda env (same as ``main2.py`` / teleop ``main.py``).
@@ -119,7 +119,14 @@ def write_robot_state_npz(path, *, joint_position, gripper_position, cmd_joint_p
     return n
 
 
-def write_meta(path, *, instruction, n_frames, config_id, timestamp, cameras, record_start, record_stop):
+def write_meta(path, *, instruction, n_frames, config_id, timestamp, cameras, record_start, record_stop,
+               trajectory_id=None, segment_source=None):
+    """Write _meta.json (ARCHITECTURE.md §3).
+
+    ``trajectory_id`` / ``segment_source`` mark this episode as one LEG of a tamp<->teleop hand-off
+    trajectory, which collect/merge_trajectory.py later joins into a single episode. Both are None
+    for a standalone episode.
+    """
     meta = {
         "instruction": instruction,
         "fps": DROID_CONTROL_FREQUENCY,
@@ -130,6 +137,8 @@ def write_meta(path, *, instruction, n_frames, config_id, timestamp, cameras, re
         "cameras": cameras,
         "record_start": float(record_start),
         "record_stop": float(record_stop),
+        "trajectory_id": trajectory_id,
+        "segment_source": segment_source,
     }
     Path(path).write_text(json.dumps(meta))
 
@@ -149,13 +158,34 @@ def write_rubric(ep_dir, *, policy, task, scene_id, prompt, criteria, max_points
 
 
 def _write_video(frames, path):
-    """Write HWC-RGB uint8 frames to an mp4 at the control frequency (lazy moviepy import)."""
-    from moviepy.editor import ImageSequenceClip
+    """Write HWC-RGB uint8 frames to an mp4 at the control frequency (lazy imageio import).
 
-    arr = [np.asarray(f, dtype=np.uint8) for f in frames]
-    ImageSequenceClip(arr, fps=DROID_CONTROL_FREQUENCY).write_videofile(
-        str(path), codec="libx264", logger=None
+    The encoder settings match tiptop's ``convert_svo_to_mp4`` (libx264 / yuv420p / crf 20), because a
+    tamp<->teleop hand-off is concatenated leg-by-leg with a stream copy: ``collect.merge_trajectory``
+    refuses to merge legs whose (codec, size, pix_fmt, frame rate) disagree.
+
+    ``macro_block_size=1`` keeps the frames at their captured resolution -- imageio's default of 16
+    silently *upscales* any dimension that isn't a multiple of 16, which would both change the recorded
+    resolution and make the leg unmergeable against a tamp leg of the true size.
+    """
+    import imageio.v2 as imageio
+
+    # imageio only starts ffmpeg on the first frame (that is where it learns the size), so writing an
+    # empty sequence would leave NO file at all and return quietly -- an episode dir with _meta.json and
+    # robot_state.npz but no video, which merge_trajectory then cannot probe. Both call sites already
+    # require n >= 2 frames; keep the old moviepy behaviour of raising so a future one cannot slip past.
+    if not len(frames):
+        raise ValueError(f"refusing to write an empty video: {path}")
+
+    writer = imageio.get_writer(
+        str(path), fps=DROID_CONTROL_FREQUENCY, codec="libx264", pixelformat="yuv420p",
+        quality=None, output_params=["-crf", "20"], macro_block_size=1, ffmpeg_log_level="error",
     )
+    try:
+        for f in frames:
+            writer.append_data(np.asarray(f, dtype=np.uint8))
+    finally:
+        writer.close()
 
 
 # --------------------------------------------------------------------------- #
