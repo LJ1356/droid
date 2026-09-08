@@ -1,3 +1,4 @@
+import threading
 import time
 
 import numpy as np
@@ -40,6 +41,16 @@ class VRPolicy:
         self.global_to_env_mat = vec_to_reorder_mat(rmat_reorder)
         self.controller_id = "r" if right_controller else "l"
         self.reset_orientation = True
+        # `update_sensor` and `reset_origin` are a PAIR and must be read and written together.
+        # The reader thread arms both when the grip is squeezed; _calculate_action consumes both.
+        # Written separately (as they were), a control step landing between the two writes refreshes
+        # the controller reading against the origin anchored when the grip was last RELEASED -- i.e.
+        # wherever the operator has carried the controller since. Driving that offset through
+        # pos_action_gain saturates the velocity command: with the two writes hand-interleaved, one
+        # control step comes out at FULL speed. The window is two statements wide, so this is a fix
+        # by construction rather than one traced to a specific run -- a threaded repro did not hit it
+        # in 300 trials. record_episode's deadman gate is what contains it either way.
+        self._flag_lock = threading.Lock()
         self.reset_state()
 
         # Start State Listening Thread #
@@ -52,8 +63,9 @@ class VRPolicy:
             "movement_enabled": False,
             "controller_on": True,
         }
-        self.update_sensor = True
-        self.reset_origin = True
+        with self._flag_lock:
+            self.update_sensor = True
+            self.reset_origin = True
         self.robot_origin = None
         self.vr_origin = None
         self.vr_state = None
@@ -73,9 +85,12 @@ class VRPolicy:
 
             # Determine Control Pipeline #
             toggled = self._state["movement_enabled"] != buttons[self.controller_id.upper() + "G"]
-            self.update_sensor = self.update_sensor or buttons[self.controller_id.upper() + "G"]
+            # Both under the lock: a squeeze arms the sensor refresh AND the origin reset, and
+            # _calculate_action has to see them together or not at all (see __init__).
+            with self._flag_lock:
+                self.update_sensor = self.update_sensor or buttons[self.controller_id.upper() + "G"]
+                self.reset_origin = self.reset_origin or toggled
             self.reset_orientation = self.reset_orientation or buttons[self.controller_id.upper() + "J"]
-            self.reset_origin = self.reset_origin or toggled
 
             # Save Info #
             self._state["poses"] = poses
@@ -122,10 +137,16 @@ class VRPolicy:
         return lin_vel, rot_vel, gripper_vel
 
     def _calculate_action(self, state_dict, include_info=False):
-        # Read Sensor #
-        if self.update_sensor:
-            self._process_reading()
+        # Take both flags in one atomic snapshot, for the reason in __init__: refreshing the reading
+        # without the origin reset that was armed with it is what produces a full-speed lurch.
+        with self._flag_lock:
+            update_sensor, reset_origin = self.update_sensor, self.reset_origin
             self.update_sensor = False
+            self.reset_origin = False
+
+        # Read Sensor #
+        if update_sensor:
+            self._process_reading()
 
         # Read Observation
         robot_pos = np.array(state_dict["cartesian_position"][:3])
@@ -134,10 +155,9 @@ class VRPolicy:
         robot_gripper = state_dict["gripper_position"]
 
         # Reset Origin On Release #
-        if self.reset_origin:
+        if reset_origin:
             self.robot_origin = {"pos": robot_pos, "quat": robot_quat}
             self.vr_origin = {"pos": self.vr_state["pos"], "quat": self.vr_state["quat"]}
-            self.reset_origin = False
 
         # Calculate Positional Action #
         robot_pos_offset = robot_pos - self.robot_origin["pos"]

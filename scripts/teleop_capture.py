@@ -172,6 +172,12 @@ class SpaceMousePolicy:
         ready once the driver is up."""
         return True
 
+    def movement_enabled(self):
+        """The SpaceMouse has no deadman, and does not need one: its action is a pure per-frame
+        deflection that reads exactly zero when the puck is centred. Letting go already stops the arm.
+        """
+        return True
+
 
 class VRPolicyDriver:
     """Wraps the DROID Oculus ``VRPolicy`` in the same ``forward(obs) -> (action, gripper_target)``
@@ -213,6 +219,13 @@ class VRPolicyDriver:
                 return True
             time.sleep(0.05)
         return False
+
+    def movement_enabled(self):
+        """Whether the operator is squeezing the grip. The VR action is a POSITION servo -- it drives
+        the arm toward the controller's displacement from an origin -- so unlike the SpaceMouse,
+        letting go does not mean zero: it means the last command stands. The grip is the deadman, and
+        record_episode will not step the robot without it."""
+        return bool(self.vr.get_info().get("movement_enabled", False))
 
     def close(self):
         pass
@@ -348,14 +361,28 @@ def record_episode(env, policy, ep_dir, args, events):
             ft_log.append(time.time())
 
             action, gtarget = policy.forward(obs)
-            cmd_g_log.append(1.0 if gtarget > 0.5 else 0.0)
+            # THE DEADMAN. Mirrors droid/trajectory_utils/misc.py::collect_trajectory, whose
+            # `skip_action` builds the action dict but never steps the robot while the grip is
+            # released. Omitting it here is what let a VR run start moving the arm the moment teleop
+            # came up, before the operator had touched the controller: the policy's action is not zero
+            # when idle (the IK carries a nullspace pull toward its joint reference, and any stale
+            # origin shows up as a position error), and every one of those frames was being sent.
+            # It is also the containment for the origin race in VRPolicy: a spurious full-speed
+            # command can only be produced on the step where the grip is FIRST seen, and this reads
+            # the grip before the policy does, so that step is still skipped.
+            driving = policy.movement_enabled()
+            # No command means no gripper command either -- record "hold what you have", not the
+            # target the operator was not asking for yet.
+            measured_grip = grip_log[-1]
+            cmd_g_log.append((1.0 if gtarget > 0.5 else 0.0) if driving else (1.0 if measured_grip > 0.5 else 0.0))
             # env.step returns the DROID action_dict. joint_velocity is the IK command (operator
             # cartesian velocity -> IK joint_delta / max_joint_delta), NORMALIZED to [-1,1] exactly like
             # lerobot/droid_1.0.1; joint_position is the IK commanded target (measured + joint_delta).
             # Capturing these is the whole point: finite-differencing the MEASURED joints instead gives
             # the ACHIEVED motion, which undertracks the command ~4-5x and puts teleop on a different
-            # scale than DROID.
-            info = env.step(action)
+            # scale than DROID. create_action_dict is the same computation WITHOUT commanding the arm,
+            # so a skipped frame still records what a zero action would have been.
+            info = env.step(action) if driving else env.create_action_dict(np.zeros_like(action))
             if not isinstance(info, dict) or "joint_velocity" not in info or "joint_position" not in info:
                 raise RuntimeError(
                     "env.step did not return the DROID action_dict with joint_velocity/joint_position; "

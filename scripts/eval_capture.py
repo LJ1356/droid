@@ -13,8 +13,9 @@ driver is instead orchestrated by the data-collection Node server: it
      ``data-collection/ARCHITECTURE.md`` §6):
 
        stdout/stderr .......... streamed to the session log
-       $EVAL_EVENTS_FILE ...... one JSON object per line (session_start, rollout_start, rollout_saved,
-                                awaiting_label, rubric_saved, awaiting_task, rollout_aborted, session_end)
+       $EVAL_EVENTS_FILE ...... one JSON object per line (session_start, rollout_start, rollout_preempted,
+                                rollout_saved, awaiting_label, rubric_saved, rollout_discarded,
+                                awaiting_task, rollout_aborted, session_end)
        stdin (line protocol) .. {"task":"<id>"} start a rollout | {"rubric":{id:bool,...}} rate the last
                                 rollout | q  finish the session
 
@@ -41,9 +42,10 @@ from typing import List, Optional
 import numpy as np
 
 # A force-stop (Node sends SIGINT to the DRIVER pid only, never the process group, so the co-spawned
-# policy server survives) sets this flag; run_rollout checks it each step and aborts the rollout,
-# keeping the warm server for the next episode. Outside a rollout the flag is harmless (cleared at the
-# next rollout start), so a stray SIGINT while parked at a prompt never crashes the driver.
+# policy server survives) sets this flag; run_rollout checks it each step, stops stepping the policy,
+# and WRITES what it captured so the operator can still grade or discard it, keeping the warm server
+# for the next episode. Outside a rollout the flag is harmless (cleared at the next rollout start), so
+# a stray SIGINT while parked at a prompt never crashes the driver.
 _ABORT = {"v": False}
 
 
@@ -120,12 +122,16 @@ def write_robot_state_npz(path, *, joint_position, gripper_position, cmd_joint_p
 
 
 def write_meta(path, *, instruction, n_frames, config_id, timestamp, cameras, record_start, record_stop,
-               trajectory_id=None, segment_source=None):
+               trajectory_id=None, segment_source=None, preempted=False):
     """Write _meta.json (ARCHITECTURE.md §3).
 
     ``trajectory_id`` / ``segment_source`` mark this episode as one LEG of a tamp<->teleop hand-off
     trajectory, which collect/merge_trajectory.py later joins into a single episode. Both are None
     for a standalone episode.
+
+    ``preempted`` records that the operator force-stopped this rollout, so it ends early by choice
+    rather than by the policy finishing or hitting max_steps. Written here (capture time) rather than
+    only in rubric.json so it survives whether or not the rollout is ever rated.
     """
     meta = {
         "instruction": instruction,
@@ -139,17 +145,21 @@ def write_meta(path, *, instruction, n_frames, config_id, timestamp, cameras, re
         "record_stop": float(record_stop),
         "trajectory_id": trajectory_id,
         "segment_source": segment_source,
+        "preempted": bool(preempted),
     }
     Path(path).write_text(json.dumps(meta))
 
 
-def write_rubric(ep_dir, *, policy, task, scene_id, prompt, criteria, max_points, duration_steps):
-    """Write rubric.json for a rated rollout and return the score dict."""
+def write_rubric(ep_dir, *, policy, task, scene_id, prompt, criteria, max_points, duration_steps,
+                 preempted=False):
+    """Write rubric.json for a rated rollout and return the score dict. A preempted rollout is rated
+    like any other -- it counts toward dense/sparse -- and merely records that it was cut short."""
     score = score_rubric(criteria, max_points)
     rec = {
         "policy": policy, "task": task, "scene_id": scene_id, "prompt": prompt,
         "criteria": {k: bool(v) for k, v in (criteria or {}).items()},
         "duration_steps": int(duration_steps),
+        "preempted": bool(preempted),
         "rated_at": datetime.datetime.now().isoformat(timespec="seconds"),
         **score,
     }
@@ -375,7 +385,9 @@ class Args:
 
 
 class RolloutAborted(Exception):
-    """Raised to abort the current rollout (SIGINT / force-stop) without ending the session."""
+    """Raised when a rollout produced nothing worth keeping, so the caller deletes its dir and returns
+    to the task prompt without ending the session. A force-stop alone does NOT raise this -- a
+    preempted rollout with >=2 frames is written and rated like any other."""
 
 
 # Manual robot nudges accepted at either prompt, mirroring tiptop_run.ROBOT_COMMANDS for the eval flow.
@@ -440,9 +452,13 @@ def _maybe_robot_command(env, cmd) -> bool:
 
 
 def run_rollout(env, policy_client, args, task, ep_dir, image_tools):
-    """Execute one closed-loop rollout of ``task`` and write the raw episode. Returns n_frames.
+    """Execute one closed-loop rollout of ``task`` and write the raw episode. Returns (n_frames, preempted).
 
-    Raises RolloutAborted if a force-stop (SIGINT) interrupts the rollout -- the caller discards it.
+    A force-stop (SIGINT) does NOT throw the rollout away: the loop stops at the next step and
+    everything captured up to that point is written exactly like a rollout that ran to max_steps, so
+    the operator still gets the rubric prompt and can grade it or discard it. Only a rollout with
+    nothing usable in it (<2 frames -- preempted within the first moment) raises RolloutAborted, and
+    the caller deletes that one.
     """
     instruction = task["prompt"]
     second_camera = "left" if args.external_camera == "right" else "right"
@@ -455,8 +471,14 @@ def run_rollout(env, policy_client, args, task, ep_dir, image_tools):
     aborted = False
     _ABORT["v"] = False  # clear any SIGINT that arrived while parked at the prompt
     for _t in range(args.max_steps):
-        if _ABORT["v"]:  # force-stop: abort this rollout, keep the warm server for the next episode
+        if _ABORT["v"]:
+            # Force-stop: stop stepping the policy, but keep everything captured so far and fall
+            # through to the write path below -- a preempted rollout is still gradable data. Emitted
+            # here (not by the caller) so the UI switches out of "running" while the mp4s are being
+            # written, which takes a few seconds.
             aborted = True
+            emit(args.events_file, "rollout_preempted", dir=str(ep_dir), task=task.get("id"),
+                 steps=len(joint_log))
             break
         t0 = time.time()
         obs = _extract_observation(env.get_observation(), args.left_camera_id, args.right_camera_id, args.wrist_camera_id)
@@ -513,7 +535,18 @@ def run_rollout(env, policy_client, args, task, ep_dir, image_tools):
             time.sleep(1 / DROID_CONTROL_FREQUENCY - elapsed)
 
     if aborted:
-        raise RolloutAborted()
+        # Halt the arm before the write path: the last thing the policy sent was a joint VELOCITY, and
+        # nothing else zeroes it until the next rollout's env.reset() -- which is now several seconds
+        # away, since the mp4s are encoded first. Zero velocity with the gripper command already in
+        # flight holds the current pose (the same step() shape the "open gripper" nudge uses).
+        # Swallowed on failure: the captured episode must still be written and offered for rating.
+        try:
+            hold = np.zeros(8, dtype=np.float64)
+            if cmd_g_log:
+                hold[-1] = float(cmd_g_log[-1])
+            env.step(hold)
+        except Exception as e:  # noqa: BLE001
+            print(f"[eval] could not halt the arm after the preempt: {e}", flush=True)
 
     # Truncate every stream to a common length so frames + state stay aligned 1:1. Without --save-video
     # the frame buffers are empty by design, so the state logs alone set the length.
@@ -521,7 +554,11 @@ def run_rollout(env, policy_client, args, task, ep_dir, image_tools):
     if args.save_video:
         n = min(n, len(ext_frames), len(wrist_frames))
     if n < 2:
-        raise RolloutAborted()  # nothing usable captured
+        # Nothing usable captured -- a preempt in the first moment, or a rollout that died instantly.
+        # There is no episode to rate, so the caller deletes the dir and returns to the task prompt.
+        raise RolloutAborted(
+            "preempted before anything was captured" if aborted else "no frames captured"
+        )
     ep_dir = Path(ep_dir)
     cameras = {}
     if args.save_video:
@@ -550,8 +587,9 @@ def run_rollout(env, policy_client, args, task, ep_dir, image_tools):
         instruction=instruction, n_frames=n, config_id=f"eval/{args.policy_name}/{task['id']}",
         timestamp=ep_dir.name, cameras=cameras,
         record_start=float(frame_time[0]), record_stop=float(frame_time[-1]),
+        preempted=aborted,
     )
-    return n
+    return n, aborted
 
 
 def _read_command():
@@ -645,20 +683,24 @@ def main(args: Args):
             ep_dir.mkdir(parents=True, exist_ok=True)
             emit(events, "rollout_start", dir=str(ep_dir), task=task_id, prompt=task["prompt"])
             try:
-                n = run_rollout(env, policy_client, args, task, ep_dir, image_tools)
-            except RolloutAborted:
+                n, preempted = run_rollout(env, policy_client, args, task, ep_dir, image_tools)
+            except RolloutAborted as e:
+                # Only reached when there was nothing worth keeping (see run_rollout): the dir goes
+                # and the driver returns to the task prompt. `reason` says which case it was, so the
+                # UI can explain why no rubric appeared.
                 shutil.rmtree(ep_dir, ignore_errors=True)
-                emit(events, "rollout_aborted", dir=str(ep_dir), task=task_id)
+                emit(events, "rollout_aborted", dir=str(ep_dir), task=task_id,
+                     reason=str(e) or "nothing usable captured")
                 continue
             except Exception as e:  # noqa: BLE001
                 shutil.rmtree(ep_dir, ignore_errors=True)
                 emit(events, "error", message=f"rollout failed: {e}")
                 continue
-            emit(events, "rollout_saved", dir=str(ep_dir), task=task_id, n_frames=n)
+            emit(events, "rollout_saved", dir=str(ep_dir), task=task_id, n_frames=n, preempted=preempted)
 
             # 4) wait for the rubric (or a finish/quit). Loop so a stray/blank line doesn't drop the
             #    rating -- the server only ever writes {"rubric":...} or "q" here.
-            emit(events, "awaiting_label", dir=str(ep_dir), task=task_id)
+            emit(events, "awaiting_label", dir=str(ep_dir), task=task_id, preempted=preempted)
             finish = False
             while True:
                 rub = _read_command()
@@ -668,7 +710,7 @@ def main(args: Args):
                 if _maybe_robot_command(env, rub):
                     # Re-emit the prompt we are still parked at, so the server clears robotBusy (a
                     # state that never changed emits nothing on its own) and keeps awaiting the rubric.
-                    emit(events, "awaiting_label", dir=str(ep_dir), task=task_id)
+                    emit(events, "awaiting_label", dir=str(ep_dir), task=task_id, preempted=preempted)
                     continue
                 if isinstance(rub, dict) and rub.get("cmd") == "reject":
                     # Rejected: the rollout was invalid (bad scene, bumped table, policy never moved).
@@ -685,8 +727,9 @@ def main(args: Args):
                     score = write_rubric(
                         ep_dir, policy=args.policy_name, task=task_id, scene_id=task.get("scene_id"),
                         prompt=task["prompt"], criteria=criteria, max_points=len(crits), duration_steps=n,
+                        preempted=preempted,
                     )
-                    emit(events, "rubric_saved", dir=str(ep_dir), task=task_id, **score)
+                    emit(events, "rubric_saved", dir=str(ep_dir), task=task_id, preempted=preempted, **score)
                     break
                 # anything else: ignore and keep awaiting the rubric
             if finish:
@@ -750,11 +793,26 @@ def _selftest():
                    record_start=1.78e9, record_stop=1.78e9 + 0.132)
         m = json.loads((d / "_meta.json").read_text())
         ok(m["fps"] == 15 and m["source"] == "pi05-eval" and m["record_stop"] > m["record_start"], "meta ok")
+        ok(m["preempted"] is False, "a rollout that ran to completion is not marked preempted")
 
         sc = write_rubric(d, policy="p", task="toys", scene_id=6, prompt="do it",
                           criteria={"a": True, "b": False}, max_points=2, duration_steps=100)
         rj = json.loads((d / "rubric.json").read_text())
         ok(sc["points"] == 1 and rj["criteria"] == {"a": True, "b": False} and rj["max_points"] == 2, "rubric.json written")
+        ok(rj["preempted"] is False, "rubric.json records the un-preempted default")
+
+        # A force-stopped rollout is written and rated exactly like any other -- the only difference is
+        # the flag both sidecars carry, so the UI (and anyone reading the run dir later) can tell it
+        # was cut short by the operator rather than by the policy or max_steps.
+        write_meta(d / "_meta.json", instruction="do it", n_frames=3, config_id="eval/p/toys",
+                   timestamp="2026", cameras={"exterior_image_1_left": EXTERNAL_CAM},
+                   record_start=1.78e9, record_stop=1.78e9 + 0.132, preempted=True)
+        ok(json.loads((d / "_meta.json").read_text())["preempted"] is True, "meta records a preempted rollout")
+        sc = write_rubric(d, policy="p", task="toys", scene_id=6, prompt="do it",
+                          criteria={"a": True, "b": True}, max_points=2, duration_steps=17, preempted=True)
+        rj = json.loads((d / "rubric.json").read_text())
+        ok(rj["preempted"] is True and sc["success"] == 1,
+           "a preempted rollout still scores normally (it is real, rated data)")
 
     print(f"  ==== {p} passed, {f} failed ====")
     sys.exit(1 if f else 0)

@@ -25,8 +25,26 @@ class RobotIKSolver:
             max_lin_vel=self.max_lin_delta,
             max_rot_vel=self.max_rot_delta,
             joint_velocity_limits=self.relative_max_joint_delta,
+            # NOTE: this solver runs on the NUC (scripts/server/run_server.py -> FrankaRobot ->
+            # RobotIKSolver), reached over zerorpc:4242. Editing it HERE changes nothing by itself --
+            # /home/prpl/droid on the NUC is the copy that executes, and run_server has to be
+            # restarted to pick it up. Kept in step so the fix survives a re-provision.
+            #
+            # Redundancy resolution is OFF for this rig, and the reference below is why it has to be.
+            # [0]*7 is not a posture the Franka can even reach (joint 4 is limited to [-3.07, -0.07],
+            # so 0 is outside its range), so the term pulls toward an unreachable configuration from
+            # wherever the arm is. Near DROID home that is invisible -- a zero cartesian action solves
+            # to |joint_delta| 0.016 -- which is why stock DROID teleop, which always starts from
+            # home, never showed it. Teleop here starts wherever TAMP handed the arm over
+            # (--keep-pose), and there the SAME zero action solves to 1.03 normalized = 0.21 rad/step
+            # = ~3 rad/s: the operator squeezes the grip without moving the controller and the arm
+            # takes off. Measured at two real hand-off poses, matching the recorded commands to 4
+            # decimals.
+            # With the gain at 0 a zero action solves to exactly zero at every pose, and a real
+            # command is no longer inflated by ~27% of motion nobody asked for. The human resolves the
+            # redundancy; joint limits are still enforced by enable_joint_position_limits.
             nullspace_joint_position_reference=[0] * 7,
-            nullspace_gain=0.025,
+            nullspace_gain=0.0,
             regularization_weight=1e-2,
             enable_joint_position_limits=True,
             minimum_distance_from_joint_position_limit=0.3,
