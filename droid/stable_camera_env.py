@@ -11,7 +11,7 @@ import multiprocessing
 import multiprocessing.synchronize
 import time
 from copy import deepcopy
-from multiprocessing import Event, Lock, Process, Queue
+from multiprocessing import Event, Lock, Process, Queue, Value
 from multiprocessing.shared_memory import SharedMemory
 
 import numpy as np
@@ -48,6 +48,8 @@ def _capture_task(
     init_event: multiprocessing.synchronize.Event,
     start_event: multiprocessing.synchronize.Event,
     stop_event: multiprocessing.synchronize.Event,
+    frame_event: multiprocessing.synchronize.Event,
+    frame_counter,
     frame_lock: multiprocessing.synchronize.Lock,
     left_shm_name: str,
     right_shm_name: str,
@@ -64,6 +66,11 @@ def _capture_task(
 
     Closing between phases ensures only one camera is on the USB bus at a time
     during initialization, preventing LOW USB BANDWIDTH errors.
+
+    ``frame_event`` is set once the FIRST grab has been written to shared memory, and
+    ``frame_counter`` counts every write after that. Both exist because the shared buffers are
+    zero-filled at creation: until a grab lands, a reader gets a pure black image that is
+    indistinguishable from a real one, and there is otherwise nothing in the observation to say so.
     """
     _res_enum_map = {
         "720": sl.RESOLUTION.HD720,
@@ -170,6 +177,10 @@ def _capture_task(
                 with frame_lock:
                     left_buf[...] = left_data
                     right_buf[...] = right_data
+                    frame_counter.value += 1
+                # Only now does the shared memory hold a picture rather than zeros.
+                if not frame_event.is_set():
+                    frame_event.set()
 
             curr_time = time.monotonic()
             sleep_until = max(sleep_until + 1.0 / frame_rate, curr_time)
@@ -186,6 +197,9 @@ class BackgroundZedCamera:
 
     The capture process opens the camera and signals init_event, but does NOT
     start grabbing until start_event is set (controlled by StableRobotEnv).
+
+    Construction returns as soon as the camera has been PROBED, which is not the same as it
+    producing frames -- use `wait_for_first_frame` before reading any.
     """
 
     def __init__(
@@ -213,6 +227,10 @@ class BackgroundZedCamera:
         )
 
         self._stop_event = Event()
+        # Set by the capture process when its first grab reaches shared memory; the counter then
+        # advances on every grab, so a caller can tell a live camera from one that has stalled.
+        self._frame_event = Event()
+        self._frame_counter = Value("L", 0)
         self._frame_lock = Lock()
         init_event = Event()
         intrinsics_queue = Queue()
@@ -227,6 +245,8 @@ class BackgroundZedCamera:
                 init_event,
                 start_event,
                 self._stop_event,
+                self._frame_event,
+                self._frame_counter,
                 self._frame_lock,
                 self._left_shm.name,
                 self._right_shm.name,
@@ -256,6 +276,30 @@ class BackgroundZedCamera:
 
         # Receive intrinsics from capture process
         self._intrinsics = intrinsics_queue.get(timeout=5)
+
+    @property
+    def frame_count(self) -> int:
+        """Grabs written into shared memory so far. Static across a step means a stalled camera."""
+        return int(self._frame_counter.value)
+
+    def wait_for_first_frame(self, timeout: float) -> bool:
+        """Block until this camera has written a real frame. False on timeout.
+
+        Nothing may read frames before this returns True. The buffers are zero-filled at creation,
+        so `get_frames()` answers a pure black image until the first grab lands -- a valid-looking
+        observation that silently blinds whatever consumes it.
+        """
+        deadline = time.monotonic() + timeout
+        while True:
+            if self._frame_event.wait(min(0.5, max(0.0, deadline - time.monotonic()))):
+                return True
+            if not self._proc.is_alive():
+                raise RuntimeError(
+                    f"Background ZED capture for {self.serial} died before delivering a frame "
+                    f"(exit code {self._proc.exitcode})"
+                )
+            if time.monotonic() >= deadline:
+                return False
 
     def get_frames(self):
         """Return (left_bgra, right_bgra) copies from shared memory."""
@@ -314,6 +358,7 @@ class StableRobotEnv:
         frame_rate: int = 30,
         camera_resolutions: dict[str, str] | None = None,
         do_reset: bool = True,
+        first_frame_timeout: float = 120.0,
     ):
         """
         Args:
@@ -323,6 +368,11 @@ class StableRobotEnv:
                 reset_joints on construction, so the arm stays wherever it already is
                 (e.g. handed off mid-pose from another controller) instead of being
                 yanked to the fixed reset pose before teleop starts.
+            first_frame_timeout: how long to wait, after the grab loops start, for EVERY camera to
+                deliver its first frame. Construction raises rather than return an env whose
+                observations are still the zero-filled buffers. Generous by default because phase 3
+                reopens each ZED and retries with a 10 s backoff when one is still being released
+                by whatever held it last.
         """
         if camera_serials is None:
             camera_serials = _discover_zed_serials()
@@ -371,8 +421,17 @@ class StableRobotEnv:
         # All cameras opened — now let them all start grabbing
         print(f"All {len(self._cameras)} cameras opened, starting grab loops...")
         self._start_event.set()
-        # Brief pause to let first frames arrive
-        time.sleep(0.5)
+
+        # Block until every camera has actually written a frame.
+        #
+        # The shared buffers are zero-filled at creation, so until the first grab lands
+        # `get_observation()` hands back a PURE BLACK image that no consumer can distinguish from a
+        # real one -- no exception, no missing key, nothing to check. A `time.sleep(0.5)` stood here
+        # and was never close to enough: phase 3 REOPENS each ZED (staggered, and retried after a
+        # 10 s backoff when the camera is still being released by whatever held it last), which
+        # routinely takes tens of seconds. A policy started in that window runs blind on black
+        # frames and the leg looks like the policy simply did nothing.
+        self._wait_for_first_frames(first_frame_timeout)
 
         self.calibration_dict = load_calibration_info()
         self.camera_type_dict = camera_type_dict
@@ -383,6 +442,30 @@ class StableRobotEnv:
             raw_intr = cam.get_intrinsics()  # {serial_left: {...}, serial_right: {...}}
             cam_stubs[serial] = self._CameraStub(serial, raw_intr)
         self._camera_reader_shim = self._CameraReaderShim(cam_stubs)
+
+    def _wait_for_first_frames(self, timeout: float) -> None:
+        """Wait for every background camera to deliver its first real frame, or raise."""
+        started = time.monotonic()
+        for serial, cam in self._cameras.items():
+            remaining = timeout - (time.monotonic() - started)
+            if remaining <= 0 or not cam.wait_for_first_frame(remaining):
+                raise RuntimeError(
+                    f"ZED {serial} delivered no frame within {timeout:.0f}s of the grab loops "
+                    "starting, so its buffer is still black. Check the camera is connected and not "
+                    "still held by another process (a tiptop run or another capture)."
+                )
+        print(
+            f"All {len(self._cameras)} cameras delivering frames "
+            f"({time.monotonic() - started:.1f}s after the grab loops started)"
+        )
+
+    def camera_frame_counts(self) -> dict[str, int]:
+        """Grabs written per camera serial. A count that does not advance is a stalled camera.
+
+        The frames themselves cannot answer this: a stalled camera keeps returning its last good
+        image, which looks entirely valid.
+        """
+        return {serial: cam.frame_count for serial, cam in self._cameras.items()}
 
     # --- Delegated methods (same interface as RobotEnv) ---
 
