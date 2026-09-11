@@ -4,11 +4,12 @@
 A HITL-TAMP task runs as ``tamp -> teleop -> tamp``: cuTAMP carries out the phases it can express and
 a person carries out the ones it cannot ("fold the cloth", "open the box"). This driver is that
 middle leg with the person replaced by a policy trained on the person -- a LeRobot ``DiffusionPolicy``
-behaviour-cloned on the teleop legs of earlier runs of the same task
-(``hitl-baseline/diffusion_policy``). It is spawned by ``tiptop_run._run_policy_phase`` once the arm
-and the ZEDs have been released, runs closed-loop for a fixed number of control steps, writes the leg
-in the raw episode format (``data-collection/ARCHITECTURE.md`` §3) and exits, handing the hardware
-back exactly as a teleop session does.
+(``hitl-baseline/diffusion_policy``) or ``ACTPolicy`` (``hitl-baseline/action_chunk_transformer``)
+behaviour-cloned on the teleop legs of earlier runs of the same task. It is spawned by
+``tiptop_run._run_policy_phase`` once the arm and the ZEDs have been released, runs closed-loop for a
+fixed number of control steps, writes the leg in the raw episode format
+(``data-collection/ARCHITECTURE.md`` §3) and exits, handing the hardware back exactly as a teleop
+session does.
 
     python scripts/policy_capture.py \\
         --output-root runs/<ws>/tamp/<name> --instruction "fold the cloth" \\
@@ -16,10 +17,11 @@ back exactly as a teleop session does.
         --trajectory-id <16 hex> --result-file /tmp/leg.json
 
 **Two processes, and why.** The arm and the cameras need ``droid`` and ``pyzed``, which are in the
-DROID conda env; the policy needs LeRobot and torch, which are in the diffusion project's venv and
-not here. So this driver starts ``python -m hitl_dp.serve`` under that venv and talks to it over a
-loopback socket (``hitl_dp.wire``, imported by path). Same split as ``eval_capture.py`` makes for
-openpi, for the same reason.
+DROID conda env; the policy needs LeRobot and torch, which are in the policy project's venv and not
+here. So this driver starts the project's server (``--policy-module``: ``hitl_dp.serve`` for a
+diffusion checkpoint, ``hitl_act.serve`` for an ACT one) under that venv and talks to it over a
+loopback socket (``hitl_dp.wire``, imported by path from ``--wire-dir``; both servers speak it). Same
+split as ``eval_capture.py`` makes for openpi, for the same reason.
 
 **The leg ends on a step count, not on success.** A behaviour-cloning policy has no termination
 signal -- no reward, no done head -- so nothing in it knows the phase is finished. ``--max-steps``
@@ -108,8 +110,8 @@ def _free_port() -> int:
 
 
 def start_policy_server(python: str, policy_dir: str, checkpoint: str, port: int, open_loop_horizon: int,
-                        device: str, num_inference_steps: int = 0):
-    """Spawn ``python -m hitl_dp.serve`` and block until it prints READY. Returns the process.
+                        device: str, num_inference_steps: int = 0, module: str = "hitl_dp.serve"):
+    """Spawn ``python -m <module>`` and block until it prints READY. Returns the process.
 
     Waiting on the READY line rather than polling the port is deliberate: the policy takes seconds to
     load and has no socket at all until it is loaded, so a connect-retry loop cannot tell "still
@@ -117,7 +119,7 @@ def start_policy_server(python: str, policy_dir: str, checkpoint: str, port: int
     to open. The server's own log is pumped to our stderr behind a prefix so it lands in the session
     log next to everything else.
     """
-    cmd = [python, "-m", "hitl_dp.serve", "--checkpoint", checkpoint, "--host", "127.0.0.1",
+    cmd = [python, "-m", module, "--checkpoint", checkpoint, "--host", "127.0.0.1",
            "--port", str(port), "--open-loop-horizon", str(open_loop_horizon), "--device", device]
     if num_inference_steps:
         cmd += ["--num-inference-steps", str(num_inference_steps)]
@@ -438,7 +440,8 @@ def main(args) -> int:
     args.external_camera_id = args.external_camera_id or varied_camera_1_id
     args.external_2_camera_id = args.external_2_camera_id or varied_camera_2_id
     args.hand_camera_id = args.hand_camera_id or hand_camera_id
-    sys.path.insert(0, str(Path(args.policy_dir) / "src"))  # hitl_dp.wire, stdlib + numpy only
+    # hitl_dp.wire, stdlib + numpy only. It lives in the diffusion project whichever server is run.
+    sys.path.insert(0, args.wire_dir or str(Path(args.policy_dir) / "src"))
 
     from hitl_dp.wire import connect
 
@@ -452,7 +455,7 @@ def main(args) -> int:
         port = args.port or _free_port()
         server = start_policy_server(args.policy_python, args.policy_dir, args.checkpoint,
                                      port, args.open_loop_horizon, args.device,
-                                     args.num_inference_steps)
+                                     args.num_inference_steps, args.policy_module)
         sock = connect("127.0.0.1", port, timeout=600.0)
         from hitl_dp.wire import request
 
@@ -525,14 +528,20 @@ def _parse_args(argv=None):
     p.add_argument("--config-id", default="tamp/policy", help="config id recorded on the leg")
     p.add_argument("--trajectory-id", default="", help="the tamp trajectory this leg is a segment of")
     p.add_argument("--checkpoint", required=True, help="LeRobot checkpoint dir (holding pretrained_model/)")
-    p.add_argument("--policy-python", required=True, help="interpreter for hitl_dp.serve (the DP venv)")
-    p.add_argument("--policy-dir", required=True, help="hitl-baseline/diffusion_policy")
+    p.add_argument("--policy-python", required=True, help="interpreter for the policy server (its project's venv)")
+    p.add_argument("--policy-dir", required=True,
+                   help="the project that serves the checkpoint: hitl-baseline/diffusion_policy or .../action_chunk_transformer")
+    p.add_argument("--policy-module", default="hitl_dp.serve",
+                   help="the server module run under --policy-python: hitl_dp.serve (diffusion) or hitl_act.serve (ACT)")
+    p.add_argument("--wire-dir", default="",
+                   help="directory holding hitl_dp/wire.py (hitl-baseline/diffusion_policy/src); default <policy-dir>/src")
     p.add_argument("--open-loop-horizon", type=int, default=8)
     p.add_argument(
         "--num-inference-steps", type=int, default=0,
-        help="denoising steps per inference; 0 keeps the checkpoint's own value (DDPM: 100, which "
-             "costs ~400 ms and drops the loop to ~9 Hz on every step where the action queue "
-             "empties). Lower it to hold 15 Hz, at some cost in action quality.",
+        help="denoising steps per inference (diffusion only; ACT has no such knob, so leave it 0); 0 "
+             "keeps the checkpoint's own value (DDPM: 100, which costs ~400 ms and drops the loop to "
+             "~9 Hz on every step where the action queue empties). Lower it to hold 15 Hz, at some "
+             "cost in action quality.",
     )
     p.add_argument("--max-steps", type=int, default=450)
     p.add_argument("--velocity-scale", type=float, default=1.0)
