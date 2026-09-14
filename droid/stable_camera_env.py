@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import multiprocessing
 import multiprocessing.synchronize
+import sys
 import time
 from copy import deepcopy
 from multiprocessing import Event, Lock, Process, Queue, Value
@@ -56,6 +57,7 @@ def _capture_task(
     intrinsics_queue: Queue,
     resolution_str: str = "720",
     reopen_delay_sec: float = 0.0,
+    open_lock: multiprocessing.synchronize.Lock | None = None,
 ):
     """Background capture process for a single ZED camera (both left and right views).
 
@@ -67,11 +69,28 @@ def _capture_task(
     Closing between phases ensures only one camera is on the USB bus at a time
     during initialization, preventing LOW USB BANDWIDTH errors.
 
+    ``open_lock`` keeps that promise for phase 3 as well. Phase 1 is serial because the parent waits
+    for each camera's ``init_event`` before starting the next process, but phase 3 fires every
+    process at once behind a sub-second stagger -- against a ``zed.open()`` that takes 6-14 s on this
+    rig, so the stagger does nothing and the opens overlap. The SDK then reports
+    ``/tmp/.zed_enum_lock - File lock timeout`` (its own enumeration lock, contended) and opens start
+    failing with CAMERA NOT DETECTED. The lock is held around one ``open()`` ATTEMPT, never around
+    the retry loop: a camera that is genuinely gone would otherwise hold it for the minutes its
+    backoff runs and keep a healthy camera from ever opening.
+
     ``frame_event`` is set once the FIRST grab has been written to shared memory, and
     ``frame_counter`` counts every write after that. Both exist because the shared buffers are
     zero-filled at creation: until a grab lands, a reader gets a pure black image that is
     indistinguishable from a real one, and there is otherwise nothing in the observation to say so.
     """
+    # This runs in a forked child whose stdout is the pipe back to the data-collection server, so
+    # Python block-buffers it: every print below would sit in an 8K buffer while the process waits
+    # out a retry backoff, and none of it reaches the log. The ZED SDK writes its own errors from C
+    # unbuffered, so a failing camera showed up as a bare, unattributable "CAMERA NOT DETECTED" --
+    # no serial, no phase, no attempt count -- while the lines that name all three were lost.
+    # (multiprocessing flushes the parent's streams before forking, so this cannot duplicate output.)
+    sys.stdout.reconfigure(line_buffering=True)
+
     _res_enum_map = {
         "720": sl.RESOLUTION.HD720,
         "1080": sl.RESOLUTION.HD1080,
@@ -97,7 +116,11 @@ def _capture_task(
         zed = sl.Camera()
         status = None
         for attempt in range(max_attempts):
-            status = zed.open(init_params)
+            if open_lock is not None:
+                with open_lock:
+                    status = zed.open(init_params)
+            else:
+                status = zed.open(init_params)
             if status in _OK_STATUSES or "CALIBRATION" in str(status):
                 if status != sl.ERROR_CODE.SUCCESS:
                     print(f"[capture] ZED {serial} {phase}: opened with warning: {status} (continuing)")
@@ -211,6 +234,7 @@ class BackgroundZedCamera:
         fps: int = 60,
         resolution_str: str = "720",
         reopen_delay_sec: float = 0.0,
+        open_lock: multiprocessing.synchronize.Lock | None = None,
     ):
         self.serial = serial
         self.width = width
@@ -253,6 +277,7 @@ class BackgroundZedCamera:
                 intrinsics_queue,
                 resolution_str,
                 reopen_delay_sec,
+                open_lock,
             ),
             daemon=True,
             name=f"bg_zed_{serial}",
@@ -392,6 +417,11 @@ class StableRobotEnv:
         # Shared event: gates the grab loop for ALL cameras.
         # Cameras open sequentially without grabbing, then all start together.
         self._start_event = Event()
+        # Shared by every capture process so only ONE zed.open() is ever in flight, in phase 3 as
+        # well as phase 1. See _capture_task's docstring: the phase-3 stagger below is far shorter
+        # than an open takes, so without this the opens overlap and contend on the SDK's own
+        # enumeration lock.
+        self._open_lock = Lock()
 
         # Open background cameras with staggered opens (no grabbing yet)
         self._cameras: dict[str, BackgroundZedCamera] = {}
@@ -414,6 +444,7 @@ class StableRobotEnv:
                 fps=cam_fps,
                 resolution_str=res_str,
                 reopen_delay_sec=0.75 * i,
+                open_lock=self._open_lock,
             )
             if i < len(camera_serials) - 1:
                 time.sleep(2.0)
